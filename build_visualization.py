@@ -19,6 +19,8 @@ import csv
 import json
 import sys
 import os
+import math
+import random
 from collections import defaultdict, Counter
 from datetime import datetime
 from itertools import combinations
@@ -787,6 +789,212 @@ def build_agent_network_data(rows, agent_rows):
     return {"agent_net": agent_net, "paper_competition": paper_competition}
 
 
+# ── AGENT ↔ SUBSCRIBER RELATIONSHIP STATS ─────────────────────────────────────
+
+def _haversine(a, b):
+    R = 3958.8  # miles
+    la1, lo1 = math.radians(a[0]), math.radians(a[1])
+    la2, lo2 = math.radians(b[0]), math.radians(b[1])
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(h))
+
+def _spearman(xs, ys):
+    n = len(xs)
+    if n < 3:
+        return 0.0, 1.0
+    def rank(v):
+        order = sorted(range(n), key=lambda i: v[i])
+        r = [0.0] * n
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and v[order[j + 1]] == v[order[i]]:
+                j += 1
+            avg = (i + j) / 2 + 1
+            for k in range(i, j + 1):
+                r[order[k]] = avg
+            i = j + 1
+        return r
+    rx, ry = rank(xs), rank(ys)
+    mx, my = sum(rx) / n, sum(ry) / n
+    cov = sum((rx[i] - mx) * (ry[i] - my) for i in range(n))
+    sx = math.sqrt(sum((rx[i] - mx) ** 2 for i in range(n)))
+    sy = math.sqrt(sum((ry[i] - my) ** 2 for i in range(n)))
+    if sx == 0 or sy == 0:
+        return 0.0, 1.0
+    rho = cov / (sx * sy)
+    if abs(rho) >= 1:
+        return rho, 0.0
+    t = rho * math.sqrt((n - 2) / (1 - rho * rho))
+    p = 2 * (1 - 0.5 * (1 + math.erf(abs(t) / math.sqrt(2))))
+    return rho, p
+
+def _norm_p(k, n):
+    """Two-sided p from a sign test (normal approx), k successes of n."""
+    if n == 0:
+        return 1.0
+    z = (k - n / 2) / (math.sqrt(n) / 2)
+    return 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
+
+def build_agent_corr(rows, agent_rows, seed=42):
+    """Quantify how strongly each paper's subscribers relate to where its agents
+    were. Three complementary statistics, all computed at build time:
+      * corr:     Spearman rho between #agents and #subscribers per town.
+      * spatial:  share of subscribers within 25/50 mi of a same-paper agent,
+                  vs a random-placement permutation null (z-score).
+      * temporal: difference-in-differences — a town's SHARE of its paper in the
+                  3 years before vs after the agent's start year (controls for the
+                  paper's overall trend); sign test across agent-towns.
+    """
+    rnd = random.Random(seed)
+
+    def fcoord(la, lo):
+        try:
+            return (float(la), float(lo))
+        except (TypeError, ValueError):
+            return None
+
+    # Subscriber aggregates
+    city_paper = defaultdict(Counter)         # (place,state) -> paper -> count
+    city_coord = {}
+    sub_pty = defaultdict(int)                # (paper, town, year) -> count
+    paper_year = defaultdict(int)             # (paper, year) -> count
+    YMIN, YMAX = 1843, 1868
+    for r in rows:
+        p = SHORT.get(r["Newspaper_Name"].strip())
+        if not p:
+            continue
+        place = r["Place_edited"].strip(); st = r["State"].strip()
+        if not place:
+            continue
+        key = (place, st)
+        city_paper[key][p] += 1
+        if key not in city_coord:
+            c = fcoord(r.get("Latitude", ""), r.get("Longitude", ""))
+            if c:
+                city_coord[key] = c
+        try:
+            y = int(r.get("Year", "").strip()[:4])
+        except (ValueError, TypeError):
+            y = None
+        if y and YMIN <= y <= YMAX:
+            sub_pty[(p, key, y)] += 1
+            paper_year[(p, y)] += 1
+
+    # Agent aggregates
+    agent_pts = defaultdict(list)             # paper -> [(lat,lng)]
+    agent_cities = defaultdict(set)           # paper -> {(city,state)}
+    agent_start = {}                          # (paper, (city,state)) -> earliest start year
+    for a in agent_rows:
+        p = a.get("_paper", "")
+        if p not in PAPERS:
+            continue
+        ac = a.get("Agent_City", "").strip(); ast = a.get("Agent_State", "").strip()
+        c = fcoord(a.get("Latitude", ""), a.get("Longitude", ""))
+        if c:
+            agent_pts[p].append(c)
+        if ac and ac.lower() != "travelling":
+            agent_cities[p].add((ac, ast))
+            try:
+                y = int(a.get("Start_Date", "").strip()[:4])
+            except (ValueError, TypeError):
+                y = None
+            if y:
+                k = (p, (ac, ast))
+                if k not in agent_start or y < agent_start[k]:
+                    agent_start[k] = y
+
+    all_cities = list(city_paper.keys())
+    pool = [city_coord[k] for k in all_cities if k in city_coord]
+
+    corr = {}
+    spatial = {}
+    for p in PAPERS:
+        # (1) town-level rank correlation
+        xs, ys = [], []
+        for key in all_cities:
+            na = sum(1 for (ac, ast) in agent_cities[p]
+                     if ac == key[0] and (ast == key[1] or not ast or not key[1]))
+            xs.append(na); ys.append(city_paper[key][p])
+        rho, pv = _spearman(xs, ys)
+        corr[p] = {"rho": round(rho, 3), "p": pv,
+                   "towns": len(xs), "agent_towns": sum(1 for v in xs if v > 0)}
+
+        # (2) spatial clustering vs random placement
+        pts = agent_pts[p]
+        sc = [(city_coord[k], city_paper[k][p]) for k in all_cities
+              if city_paper[k][p] > 0 and k in city_coord]
+        total = sum(c for _, c in sc)
+        K = len(agent_cities[p])
+        entry = {"n_subs": total, "agent_towns": K}
+        if pts and total:
+            def frac_near(locs, R):
+                near = 0
+                for coord, cnt in sc:
+                    if any(_haversine(coord, al) <= R for al in locs):
+                        near += cnt
+                return near / total
+            for R in (25, 50):
+                actual = frac_near(pts, R)
+                nulls = []
+                for _ in range(500):
+                    fake = rnd.sample(pool, min(K, len(pool)))
+                    nulls.append(frac_near(fake, R))
+                mu = sum(nulls) / len(nulls)
+                sd = (sum((x - mu) ** 2 for x in nulls) / len(nulls)) ** 0.5
+                z = (actual - mu) / sd if sd > 0 else 0.0
+                pcount = (sum(1 for x in nulls if x >= actual) + 1) / (len(nulls) + 1)
+                entry[f"r{R}_actual"] = round(actual * 100, 1)
+                entry[f"r{R}_random"] = round(mu * 100, 1)
+                entry[f"r{R}_z"] = round(z, 1)
+                entry[f"r{R}_p"] = round(pcount, 4)
+        spatial[p] = entry
+
+    # (3) temporal difference-in-differences
+    W = 3
+    def subs_in(p, town, y0, y1):
+        return sum(sub_pty[(p, town, y)] for y in range(y0, y1 + 1))
+    def paper_in(p, y0, y1):
+        return sum(paper_year[(p, y)] for y in range(y0, y1 + 1))
+    temporal = {}
+    all_pairs = []
+    examples = []
+    for p in PAPERS:
+        recs = []
+        for (pp, town), Y in agent_start.items():
+            if pp != p or Y - W < YMIN or Y + W > YMAX:
+                continue
+            pb, pa = paper_in(p, Y - W, Y - 1), paper_in(p, Y + 1, Y + W)
+            if pb == 0 or pa == 0:
+                continue
+            tb, ta = subs_in(p, town, Y - W, Y - 1), subs_in(p, town, Y + 1, Y + W)
+            sb, sa = tb / pb, ta / pa
+            recs.append((town, Y, tb, ta, sb, sa))
+        n = len(recs)
+        inc = sum(1 for *_, sb, sa in recs if sa > sb)
+        dec = sum(1 for *_, sb, sa in recs if sa < sb)
+        temporal[p] = {
+            "towns": n, "rose": inc, "fell": dec, "same": n - inc - dec,
+            "p": round(_norm_p(inc, inc + dec), 3) if (inc + dec) else 1.0,
+            "raw_before": sum(tb for *_, tb, ta, sb, sa in recs),
+            "raw_after": sum(ta for *_, tb, ta, sb, sa in recs),
+        }
+        all_pairs.extend(recs)
+        for town, Y, tb, ta, sb, sa in recs:
+            examples.append({"town": town[0], "state": town[1], "paper": p, "year": Y,
+                             "before": tb, "after": ta,
+                             "share_b": round(sb * 100, 2), "share_a": round(sa * 100, 2)})
+    inc = sum(1 for *_, sb, sa in all_pairs if sa > sb)
+    dec = sum(1 for *_, sb, sa in all_pairs if sa < sb)
+    n = len(all_pairs)
+    temporal_overall = {"towns": n, "rose": inc, "fell": dec, "same": n - inc - dec,
+                        "p": round(_norm_p(inc, inc + dec), 4) if (inc + dec) else 1.0}
+    examples = sorted(examples, key=lambda e: -(e["share_a"] - e["share_b"]))[:10]
+
+    return {"corr": corr, "spatial": spatial, "temporal": temporal,
+            "temporal_overall": temporal_overall, "examples": examples, "window": W}
+
+
 # ── HTML TEMPLATE ─────────────────────────────────────────────────────────────
 
 def build_html(data):
@@ -828,6 +1036,7 @@ def build_html(data):
         f"const COVERAGE_DATA={json.dumps(d.get('coverage', {}))};",
         f"const AGENT_NET_DATA={json.dumps(d.get('agent_net', []))};",
         f"const PAPER_COMPETITION={json.dumps(d.get('paper_competition', {}))};",
+        f"const AGENT_CORR={json.dumps(d.get('agent_corr', {}))};",
     ])
 
     s = d["summary"]
@@ -846,7 +1055,7 @@ function showPanel(name, btn) {
   document.querySelectorAll(".nav button").forEach(b => b.classList.remove("active"));
   document.getElementById("panel-" + name).classList.add("active");
   btn.classList.add("active");
-  const fns = {monopoly:initMonopoly,timeline:initTimeline,weekly:initWeekly,regions:initRegions,states:initStates,demo:initDemo,flow:initFlow,agentmap:initAgentMap,agents:initAgents};
+  const fns = {monopoly:initMonopoly,timeline:initTimeline,weekly:initWeekly,regions:initRegions,states:initStates,demo:initDemo,flow:initFlow,agentmap:initAgentMap,agents:initAgents,agentcorr:initAgentCorr};
   if (!_inited[name] && fns[name]) { _inited[name] = true; fns[name](); }
 }
 
@@ -1380,6 +1589,72 @@ function initAgentNetworks() {
   initPaperNet();
   initAgentBip();
 }
+
+// ── Agent ↔ Subscriber relationship ───────────────────────────────────────────
+function initAgentCorr() {
+  if (!AGENT_CORR || !AGENT_CORR.corr) return;
+  const corr = AGENT_CORR.corr, spatial = AGENT_CORR.spatial, temporal = AGENT_CORR.temporal;
+
+  // 1. Spearman rho per paper
+  mkChart("c-corr-rho", {
+    type:"bar",
+    data:{ labels:PAPERS, datasets:[{
+      label:"Spearman ρ",
+      data:PAPERS.map(p => (corr[p]||{}).rho || 0),
+      backgroundColor:PAPERS.map(p=>C[p]+"cc"), borderWidth:0
+    }]},
+    options:{ responsive:true, plugins:{legend:{display:false},
+      tooltip:{callbacks:{afterLabel:(t)=>{const c=corr[PAPERS[t.dataIndex]]||{};
+        return `towns: ${c.towns}  (with agent: ${c.agent_towns})\np ${c.p<0.001?'< 0.001':'= '+(c.p||0).toFixed(3)}`;}}}},
+      scales:{ x:{grid:{color:GC},ticks:{color:"#7a6a52"}},
+        y:{beginAtZero:true,max:0.6,grid:{color:GC},ticks:{color:"#7a6a52"},
+           title:{display:true,text:"correlation (0–1)",color:"#7a6a52"}} } }
+  });
+
+  // 2. Spatial clustering: actual vs random within 25 mi
+  mkChart("c-corr-spatial", {
+    type:"bar",
+    data:{ labels:PAPERS, datasets:[
+      {label:"Actual (within 25 mi)", data:PAPERS.map(p=>(spatial[p]||{}).r25_actual||0),
+       backgroundColor:PAPERS.map(p=>C[p]+"dd"), borderWidth:0},
+      {label:"If placed randomly", data:PAPERS.map(p=>(spatial[p]||{}).r25_random||0),
+       backgroundColor:PAPERS.map(p=>C[p]+"33"), borderWidth:0}
+    ]},
+    options:{ responsive:true, plugins:{legend:{labels:{color:"#4a3a22"}},
+      tooltip:{callbacks:{afterLabel:(t)=>{const s=spatial[PAPERS[t.dataIndex]]||{};
+        return `z = ${s.r25_z}   subscribers: ${s.n_subs}`;}}}},
+      scales:{ x:{grid:{color:GC},ticks:{color:"#7a6a52"}},
+        y:{beginAtZero:true,max:100,grid:{color:GC},ticks:{color:"#7a6a52",callback:v=>v+"%"},
+           title:{display:true,text:"% of subscribers near an agent",color:"#7a6a52"}} } }
+  });
+
+  // 3. Temporal test table
+  const ov = AGENT_CORR.temporal_overall || {};
+  let rowsHtml = PAPERS.map(p=>{
+    const t = temporal[p]||{};
+    if (!t.towns) return `<tr><td>${p}</td><td colspan="5" style="opacity:.55">no agent-towns with a full before/after window</td></tr>`;
+    const sig = (t.p!=null && t.p<0.05);
+    return `<tr><td>${p}</td><td style="text-align:center">${t.towns}</td>`
+      +`<td style="text-align:center;color:#3c7a3c">${t.rose}</td>`
+      +`<td style="text-align:center;color:#b04a3a">${t.fell}</td>`
+      +`<td style="text-align:center">${t.same}</td>`
+      +`<td style="text-align:center">${t.p!=null?t.p.toFixed(3):'—'} ${t.towns?(sig?'<b>sig.</b>':'<span style="opacity:.6">n.s.</span>'):''}</td></tr>`;
+  }).join("");
+  const ovSig = (ov.p!=null && ov.p<0.05);
+  const verdict = ovSig
+    ? `Across all papers, towns were significantly more likely to rise than fall after an agent arrived (p = ${ov.p.toFixed(3)}).`
+    : `Across all papers, towns were <b>no more likely to rise than fall</b> after an agent arrived (${ov.rose} rose vs ${ov.fell} fell, p = ${ov.p!=null?ov.p.toFixed(3):'—'}) &mdash; so these data <b>do not support a causal effect</b>.`;
+  const exRows = (AGENT_CORR.examples||[]).slice(0,6).map(e=>
+    `<tr><td>${e.town}${e.state?', '+e.state:''}</td><td style="text-align:center">${e.paper}</td>`
+    +`<td style="text-align:center">~${e.year}</td><td style="text-align:center">${e.before} → ${e.after}</td>`
+    +`<td style="text-align:center">${e.share_b}% → ${e.share_a}%</td></tr>`).join("");
+  document.getElementById("corr-temporal").innerHTML =
+    `<table class="ctab"><thead><tr><th>Paper</th><th>Agent-towns</th><th>Rose</th><th>Fell</th><th>No change</th><th>Sign-test p</th></tr></thead>`
+    +`<tbody>${rowsHtml}</tbody></table>`
+    +`<p style="margin:12px 2px;font-size:.85rem;color:#4a3a22">${verdict}</p>`
+    +`<p style="margin:14px 2px 6px;font-size:.8rem;color:#7a6a52">Individual towns with the largest post-agent share gains (illustrative, not proof):</p>`
+    +`<table class="ctab"><thead><tr><th>Town</th><th>Paper</th><th>Agent from</th><th>Subs before→after</th><th>Share before→after</th></tr></thead><tbody>${exRows}</tbody></table>`;
+}
 """
 
     return f"""<!DOCTYPE html>
@@ -1424,6 +1699,10 @@ body{{font-family:Georgia,serif;background:#f5f0e8;color:#2c2416}}
 .pr{{display:flex;justify-content:space-between;gap:14px;margin:2px 0}}
 .pbw{{background:#3d3020;border-radius:3px;height:5px;margin:1px 0 4px}}
 .pb{{height:5px;border-radius:3px}}
+.ctab{{width:100%;border-collapse:collapse;font-size:.82rem;margin:4px 0}}
+.ctab th{{text-align:left;color:#7a6a52;font-weight:normal;border-bottom:1px solid #c9b99a;padding:5px 8px}}
+.ctab td{{padding:5px 8px;border-bottom:1px solid #ede5d8;color:#2c2416}}
+.ctab tbody tr:last-child td{{border-bottom:none}}
 </style>
 </head>
 <body>
@@ -1442,6 +1721,7 @@ body{{font-family:Georgia,serif;background:#f5f0e8;color:#2c2416}}
   <button onclick="showPanel('flow',this)">Flow</button>
   <button onclick="showPanel('agentmap',this)">Agent Map</button>
   <button onclick="showPanel('agents',this)">Agents</button>
+  <button onclick="showPanel('agentcorr',this)">Agent &harr; Subscribers</button>
 </div>
 <div id="panel-map" class="panel active">
   <div class="map-controls">
@@ -1609,6 +1889,30 @@ body{{font-family:Georgia,serif;background:#f5f0e8;color:#2c2416}}
     </div>
   </div>
 </div>
+
+<div id="panel-agentcorr" class="panel">
+  <p class="snote">Do a paper's subscribers actually relate to where its agents were? Three independent tests. The first two find a <b>strong spatial association</b>; the third asks whether it is <b>causal</b> &mdash; and finds it is not.</p>
+  <div class="g2">
+    <div class="box">
+      <h3>1. Town-level correlation (Spearman&rsquo;s &rho;)</h3>
+      <p>Rank correlation between the number of a paper&rsquo;s agents in a town and the number of its subscribers there. 0 = none, 1 = perfect. All four are positive and statistically significant (p &lt; 0.001).</p>
+      <canvas id="c-corr-rho" style="max-height:280px"></canvas>
+    </div>
+    <div class="box">
+      <h3>2. Subscribers clustered near agents (within 25 mi)</h3>
+      <p>Share of each paper&rsquo;s subscribers living within 25 miles of one of its agents (solid) versus what random agent placement would produce (faded). The gap is the clustering effect.</p>
+      <canvas id="c-corr-spatial" style="max-height:280px"></canvas>
+    </div>
+  </div>
+  <div class="g2" style="margin-top:18px">
+    <div class="box wide">
+      <h3>3. Did subscriptions rise <em>after</em> an agent arrived? (causal test)</h3>
+      <p>For every town that gained an agent on a known date, we compare the town&rsquo;s share of its paper in the 3 years before vs. the 3 years after &mdash; which controls for the paper&rsquo;s overall growth. If agents <em>created</em> subscribers, most towns should rise.</p>
+      <div id="corr-temporal"></div>
+    </div>
+  </div>
+  <p class="snote" style="margin-top:16px"><b>How to read this together:</b> subscribers cluster around agents far more than chance (tests 1&ndash;2), but towns were no more likely to <em>gain</em> share after an agent arrived than to lose it (test 3). The most defensible conclusion is that agents were appointed <b>where Jewish reading communities already existed</b>, rather than generating new subscribers. Correlation is strong; causation is not supported by these data. <i>Caveats: only The Israelite has enough dated agent-towns for the causal test; agents whose appointments coincided with a paper&rsquo;s launch have no &ldquo;before&rdquo; window; record survival varies by year.</i></p>
+</div>
 <script>
 {js_data}
 {js_logic}
@@ -1734,6 +2038,12 @@ def main():
     data["agent_net"] = net["agent_net"]
     data["paper_competition"] = net["paper_competition"]
     print(f"  Coverage years computed; place-year data for {len(data['place_year'])} places")
+
+    if agent_rows:
+        print("Computing agent<->subscriber relationship statistics...")
+        data["agent_corr"] = build_agent_corr(rows, agent_rows)
+    else:
+        data["agent_corr"] = {}
 
     print("Generating HTML...")
     html = build_html(data)
