@@ -63,9 +63,39 @@ def load_csv(path):
     with open(path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
+
+def autodetect_subscriber_csv(directory="."):
+    """Find the subscriber CSV in `directory` so the site can be rebuilt just by
+    dropping a new file in. Agent CSVs (named "* Agents.csv") are ignored. If
+    several candidates exist, the most recently modified wins, with the filename
+    as a tiebreaker so e.g. "Subscribers (7).csv" beats "Subscribers (6).csv".
+    Returns a path, or None if no suitable CSV is present."""
+    candidates = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    for f in names:
+        if not f.lower().endswith(".csv"):
+            continue
+        if "agent" in f.lower():            # skip the four agent CSVs
+            continue
+        candidates.append(os.path.join(directory, f))
+    if not candidates:
+        return None
+    # Prefer files that look like the subscriber export, else consider all CSVs.
+    preferred = [c for c in candidates if "subscriber" in os.path.basename(c).lower()]
+    pool = preferred or candidates
+    pool.sort(key=lambda p: (os.path.getmtime(p), os.path.basename(p)), reverse=True)
+    return pool[0]
+
 # ── DATA BUILDERS ─────────────────────────────────────────────────────────────
 
 def build_map_data(rows):
+    # Key by (place, state, country) — NOT place name alone. Different cities that
+    # share a name (Columbus OH vs GA, Alexandria VA vs LA, Portland OR vs ME) must
+    # stay separate map points; keying by name only collapsed them into one dot,
+    # placed at whichever row was read last and with their subscriber counts summed.
     places = defaultdict(lambda: {"lat": None, "lng": None, "state": "", "country": "", "papers": defaultdict(int), "years": set()})
     for r in rows:
         loc = r["Place_edited"].strip()
@@ -77,17 +107,19 @@ def build_map_data(rows):
             lat_f, lng_f = float(lat), float(lng)
         except ValueError:
             continue
-        p = places[loc]
+        state = r["State"].strip()
+        country = r["Country"].strip()
+        p = places[(loc, state, country)]
         p["lat"] = lat_f
         p["lng"] = lng_f
-        p["state"] = r["State"].strip()
-        p["country"] = r["Country"].strip()
+        p["state"] = state
+        p["country"] = country
         p["papers"][r["Newspaper_Name"]] += 1
         if r["Year"].strip():
             p["years"].add(r["Year"].strip())
 
     result = []
-    for loc, d in places.items():
+    for (loc, state, country), d in places.items():
         total = sum(d["papers"].values())
         result.append({
             "loc": loc, "lat": d["lat"], "lng": d["lng"],
@@ -632,16 +664,20 @@ def build_place_year_data(rows, map_data):
     For each place in map_data, return a year-by-year breakdown of subscription
     counts per paper: {loc: {year: {paper_short: count}}}.
     """
-    top_locs = {p["loc"] for p in map_data}
+    # Key by "place|state|country" to match the map points from build_map_data,
+    # so same-named cities in different states keep separate year breakdowns.
+    top_keys = {(p["loc"], p["state"], p["country"]) for p in map_data}
     place_year = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
     for r in rows:
         paper = SHORT.get(r["Newspaper_Name"], "")
         loc   = r.get("Place_edited", "").strip()
+        state = r.get("State", "").strip()
+        country = r.get("Country", "").strip()
         year  = r.get("Year", "").strip()
-        if paper and loc and year and loc in top_locs:
-            place_year[loc][year][paper] += 1
-    return {loc: {yr: dict(papers) for yr, papers in yrs.items()}
-            for loc, yrs in place_year.items()}
+        if paper and loc and year and (loc, state, country) in top_keys:
+            place_year[f"{loc}|{state}|{country}"][year][paper] += 1
+    return {key: {yr: dict(papers) for yr, papers in yrs.items()}
+            for key, yrs in place_year.items()}
 
 
 def build_agent_network_data(rows, agent_files):
@@ -765,7 +801,8 @@ PAPERS.forEach(p => { mLayers[p] = L.layerGroup().addTo(lmap); });
 
 function getYrCount(place, sn) {
   if (!mapYear) return place.papers[S2F[sn]] || 0;
-  return ((PLACE_YEAR_DATA[place.loc] || {})[String(mapYear)] || {})[sn] || 0;
+  const key = `${place.loc}|${place.state}|${place.country}`;
+  return ((PLACE_YEAR_DATA[key] || {})[String(mapYear)] || {})[sn] || 0;
 }
 
 function rebuildMapLayers() {
@@ -1538,13 +1575,29 @@ def main():
     # Agent CSVs are optional. If not specified, the script will look for the
     # DEFAULT_AGENT_CSVS filenames in the same directory as the subscriber CSV.
     args = sys.argv[1:]
-    csv_path = args[0] if len(args) >= 1 else DEFAULT_CSV
+    explicit_csv = bool(len(args) >= 1 and args[0])
+    csv_path = args[0] if explicit_csv else DEFAULT_CSV
     out_path = args[1] if len(args) >= 2 else DEFAULT_OUT
 
     if not os.path.exists(csv_path):
-        print(f"Error: CSV file not found: {csv_path}")
-        print(f"Usage: python build_visualization.py [input.csv] [output.html] [agent csvs...]")
-        sys.exit(1)
+        # Nothing at the given/default path — try to find a subscriber CSV sitting
+        # in the working directory. This powers the "just add a new CSV" workflow
+        # (see .github/workflows/static.yml), so a fresh export can be dropped in
+        # under any name and the site rebuilds from it automatically.
+        detected = autodetect_subscriber_csv(".")
+        if detected:
+            print(f"Auto-detected subscriber CSV: {detected}")
+            csv_path = detected
+        elif explicit_csv:
+            # The user named a specific file that isn't there — that's an error.
+            print(f"Error: CSV file not found: {csv_path}")
+            print(f"Usage: python build_visualization.py [input.csv] [output.html] [agent csvs...]")
+            sys.exit(1)
+        else:
+            # No CSV anywhere. Don't fail the deploy — leave the existing HTML as-is.
+            print("No subscriber CSV found in this folder — leaving existing output untouched.")
+            print("Add a .csv export (e.g. Subscribers2026.csv) and re-run to rebuild.")
+            sys.exit(0)
 
     # Determine agent CSV paths
     csv_dir = os.path.dirname(os.path.abspath(csv_path))
