@@ -57,6 +57,20 @@ def get_region(state):
 def short(paper):
     return SHORT.get(paper, paper)
 
+def place_key(loc, state, country):
+    """Identity of a mappable place, used to group subscriptions into one dot.
+    Within a US state the state name alone identifies the town (Columbus, Ohio vs
+    Columbus, Georgia), so country is dropped from the key — otherwise rows where
+    Country is blank vs "United States of America" would split into two dots stacked
+    on the same spot. For foreign rows State is blank/"Null", so country is what
+    keeps two same-named foreign cities apart."""
+    loc = (loc or "").strip()
+    state = (state or "").strip()
+    country = (country or "").strip()
+    if state and state.lower() != "null":
+        return (loc, state, "")
+    return (loc, "", country)
+
 # ── LOAD ──────────────────────────────────────────────────────────────────────
 
 def load_csv(path):
@@ -89,6 +103,31 @@ def autodetect_subscriber_csv(directory="."):
     pool.sort(key=lambda p: (os.path.getmtime(p), os.path.basename(p)), reverse=True)
     return pool[0]
 
+
+def autodetect_combined_agents_csv(directory="."):
+    """Find a single combined agents CSV — one whose header has both an
+    Agent_Name and a Newspaper_Name column (so the paper can be read per row).
+    Newest wins. Returns a path, or None."""
+    best = None
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    for f in names:
+        if not f.lower().endswith(".csv") or "agent" not in f.lower():
+            continue
+        path = os.path.join(directory, f)
+        try:
+            with open(path, encoding="utf-8-sig", newline="") as fh:
+                header = next(csv.reader(fh), [])
+        except Exception:
+            continue
+        cols = {c.strip() for c in header}
+        if "Agent_Name" in cols and "Newspaper_Name" in cols:
+            if best is None or os.path.getmtime(path) > os.path.getmtime(best):
+                best = path
+    return best
+
 # ── DATA BUILDERS ─────────────────────────────────────────────────────────────
 
 def build_map_data(rows):
@@ -109,21 +148,24 @@ def build_map_data(rows):
             continue
         state = r["State"].strip()
         country = r["Country"].strip()
-        p = places[(loc, state, country)]
+        key = place_key(loc, state, country)
+        p = places[key]
         p["lat"] = lat_f
         p["lng"] = lng_f
-        p["state"] = state
-        p["country"] = country
+        p["state"] = state or p["state"]
+        p["country"] = country or p["country"]   # keep a non-blank country if any row has one
         p["papers"][r["Newspaper_Name"]] += 1
         if r["Year"].strip():
             p["years"].add(r["Year"].strip())
 
     result = []
-    for (loc, state, country), d in places.items():
+    for key, d in places.items():
+        loc = key[0]
         total = sum(d["papers"].values())
         result.append({
             "loc": loc, "lat": d["lat"], "lng": d["lng"],
             "state": d["state"], "country": d["country"],
+            "key": "|".join(key),
             "total": total,
             "num_papers": sum(1 for v in d["papers"].values() if v > 0),
             "papers": dict(d["papers"]),
@@ -465,115 +507,135 @@ def geocode_agent_city(city):
     return None, None
 
 
-def build_agent_data(agent_files):
-    """
-    Process four agent CSV files and return a dict with agent map points,
-    timeline, tenure, and city competition data.
+def load_agent_rows(agent_source):
+    """Return a flat list of agent row dicts, each tagged with '_paper' (short
+    paper name). Accepts either:
+      * a path to ONE combined agents CSV — the paper is read from each row's
+        Newspaper_Name column (rows for papers the site doesn't chart, e.g. The
+        Asmonean, or with a blank paper, are skipped); or
+      * a {paper_short: path} dict of four per-paper CSVs — the paper is the key.
+    This lets the site be rebuilt from a single combined export or the older
+    four-file layout without changing anything downstream."""
+    out = []
+    if isinstance(agent_source, dict):
+        for paper, fpath in agent_source.items():
+            if not fpath or not os.path.exists(fpath):
+                continue
+            try:
+                with open(fpath, encoding="utf-8-sig") as f:
+                    for row in csv.DictReader(f):
+                        row = dict(row)
+                        row["_paper"] = paper
+                        out.append(row)
+            except Exception as e:
+                print(f"  Warning: could not read {fpath}: {e}")
+    elif agent_source and os.path.exists(agent_source):
+        try:
+            with open(agent_source, encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    paper = SHORT.get(row.get("Newspaper_Name", "").strip(), "")
+                    if paper not in PAPERS:   # skip Asmonean / blank / unknown
+                        continue
+                    row = dict(row)
+                    row["_paper"] = paper
+                    out.append(row)
+        except Exception as e:
+            print(f"  Warning: could not read {agent_source}: {e}")
+    return out
 
-    agent_files: dict mapping paper short name -> file path (or None if missing)
+
+def build_agent_data(agent_rows):
+    """
+    Turn a flat list of agent rows (from load_agent_rows) into map points,
+    timeline, tenure, and city-competition data.
     """
     agent_map = []   # [{paper, name, city, state, lat, lng, start, end, addr, notes}]
-    agent_timeline = {}   # {paper: {year: count}}
     agent_tenure = []     # [{paper, name, city, start, end, duration}]
     city_papers = defaultdict(lambda: defaultdict(int))   # city -> paper -> count
+    tl_by_paper = defaultdict(lambda: defaultdict(int))   # paper -> year -> count
 
-    for paper, fpath in agent_files.items():
-        if not fpath or not os.path.exists(fpath):
-            continue
+    def parse_year(raw):
+        # Parse year from ISO timestamp ("1860-12-28T00:00:00Z") or plain int
+        if not raw:
+            return None
         try:
-            with open(fpath, encoding="utf-8-sig") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-        except Exception as e:
-            print(f"  Warning: could not read {fpath}: {e}")
+            return int(raw[:4])  # works for both ISO dates and plain year strings
+        except (ValueError, TypeError):
+            return None
+
+    for row in agent_rows:
+        paper = row.get("_paper", "")
+        name = row.get("Agent_Name", row.get("Agent Name", row.get("Name", ""))).strip()
+        if not name:
             continue
 
-        tl = defaultdict(int)
+        city = row.get("Agent_City", row.get("City", "")).strip()
+        state = row.get("Agent_State", row.get("State", "")).strip()
+        addr = row.get("Agent_Address", row.get("Address", "")).strip()
+        # Gleaner uses "Notes" instead of "Agent_Notes"
+        notes = (row.get("Agent_Notes") or row.get("Notes") or "").strip()
 
-        for row in rows:
-            # Column name is Agent_Name across all four CSVs
-            name = row.get("Agent_Name", row.get("Agent Name", row.get("Name", ""))).strip()
-            if not name:
-                continue
+        start_raw = (row.get("Start_Date") or row.get("Agent_Start_Year") or "").strip()
+        end_raw = (row.get("End_Date") or row.get("Agent_End_Year") or "").strip()
 
-            city = row.get("Agent_City", row.get("City", "")).strip()
-            state = row.get("Agent_State", row.get("State", "")).strip()
-            addr = row.get("Agent_Address", row.get("Address", "")).strip()
-            # Gleaner uses "Notes" instead of "Agent_Notes"
-            notes = (row.get("Agent_Notes") or row.get("Notes") or "").strip()
+        # Skip "Travelling" as it has no fixed location
+        if city.lower() == "travelling":
+            city = ""
 
-            # Dates are ISO timestamps like "1860-12-28T00:00:00Z" - extract year
-            start_raw = (row.get("Start_Date") or row.get("Agent_Start_Year") or "").strip()
-            end_raw = (row.get("End_Date") or row.get("Agent_End_Year") or "").strip()
+        # Use lat/lng from CSV if available; fall back to geocode cache
+        lat = None
+        lng = None
+        try:
+            lat_raw = row.get("Latitude", "").strip()
+            lng_raw = row.get("Longitude", "").strip()
+            if lat_raw and lng_raw:
+                lat = float(lat_raw)
+                lng = float(lng_raw)
+        except (ValueError, AttributeError):
+            pass
+        if lat is None and city:
+            lat, lng = geocode_agent_city(city)
 
-            # Skip "Travelling" as it has no fixed location
-            if city.lower() == "travelling":
-                city = ""
+        start_yr = parse_year(start_raw)
+        end_yr = parse_year(end_raw)
 
-            # Use lat/lng from CSV if available; fall back to geocode cache
-            lat = None
-            lng = None
-            try:
-                lat_raw = row.get("Latitude", "").strip()
-                lng_raw = row.get("Longitude", "").strip()
-                if lat_raw and lng_raw:
-                    lat = float(lat_raw)
-                    lng = float(lng_raw)
-            except (ValueError, AttributeError):
-                pass
-            if lat is None and city:
-                lat, lng = geocode_agent_city(city)
+        # Build timeline entry: count agents active in each year
+        if start_yr:
+            if end_yr and end_yr >= start_yr:
+                for yr in range(start_yr, end_yr + 1):
+                    tl_by_paper[paper][str(yr)] += 1
+            else:
+                tl_by_paper[paper][str(start_yr)] += 1
 
-            start_yr = None
-            end_yr = None
-            # Parse year from ISO timestamp ("1860-12-28T00:00:00Z") or plain int
-            def parse_year(raw):
-                if not raw:
-                    return None
-                try:
-                    return int(raw[:4])  # works for both ISO dates and plain year strings
-                except (ValueError, TypeError):
-                    return None
-            start_yr = parse_year(start_raw)
-            end_yr = parse_year(end_raw)
-
-            # Build timeline entry: count agents active in each year
-            if start_yr:
-                if end_yr and end_yr >= start_yr:
-                    for yr in range(start_yr, end_yr + 1):
-                        tl[str(yr)] += 1
-                else:
-                    tl[str(start_yr)] += 1
-
-            # Build tenure record for agents with both dates
-            if start_yr and end_yr and end_yr >= start_yr:
-                agent_tenure.append({
-                    "paper": paper,
-                    "name": name,
-                    "city": city,
-                    "start": start_yr,
-                    "end": end_yr,
-                    "duration": end_yr - start_yr
-                })
-
-            # Map point
-            agent_map.append({
+        # Build tenure record for agents with both dates
+        if start_yr and end_yr and end_yr >= start_yr:
+            agent_tenure.append({
                 "paper": paper,
                 "name": name,
                 "city": city,
-                "state": state,
-                "lat": lat,
-                "lng": lng,
                 "start": start_yr,
                 "end": end_yr,
-                "addr": addr,
-                "notes": notes,
+                "duration": end_yr - start_yr
             })
 
-            if city:
-                city_papers[city][paper] += 1
+        # Map point
+        agent_map.append({
+            "paper": paper,
+            "name": name,
+            "city": city,
+            "state": state,
+            "lat": lat,
+            "lng": lng,
+            "start": start_yr,
+            "end": end_yr,
+            "addr": addr,
+            "notes": notes,
+        })
 
-        agent_timeline[paper] = sorted(tl.items())
+        if city:
+            city_papers[city][paper] += 1
+
+    agent_timeline = {p: sorted(tl_by_paper[p].items()) for p in tl_by_paper}
 
     # Compute all years range
     all_years = set()
@@ -664,27 +726,29 @@ def build_place_year_data(rows, map_data):
     For each place in map_data, return a year-by-year breakdown of subscription
     counts per paper: {loc: {year: {paper_short: count}}}.
     """
-    # Key by "place|state|country" to match the map points from build_map_data,
-    # so same-named cities in different states keep separate year breakdowns.
-    top_keys = {(p["loc"], p["state"], p["country"]) for p in map_data}
+    # Key by the same place_key() the map points use, so same-named cities in
+    # different states keep separate year breakdowns and the map popup can look
+    # up its point by the "key" field build_map_data stores.
+    valid = {p["key"] for p in map_data}
     place_year = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
     for r in rows:
         paper = SHORT.get(r["Newspaper_Name"], "")
         loc   = r.get("Place_edited", "").strip()
-        state = r.get("State", "").strip()
-        country = r.get("Country", "").strip()
         year  = r.get("Year", "").strip()
-        if paper and loc and year and (loc, state, country) in top_keys:
-            place_year[f"{loc}|{state}|{country}"][year][paper] += 1
+        key   = "|".join(place_key(loc, r.get("State", ""), r.get("Country", "")))
+        if paper and loc and year and key in valid:
+            place_year[key][year][paper] += 1
     return {key: {yr: dict(papers) for yr, papers in yrs.items()}
             for key, yrs in place_year.items()}
 
 
-def build_agent_network_data(rows, agent_files):
+def build_agent_network_data(rows, agent_rows):
     """
     Builds two network datasets:
     1. agent_net: top agents by subscriber recruitment (from Subscriber Agent field).
     2. paper_competition: pairs of papers with lists of shared agent cities.
+
+    agent_rows: flat list of agent row dicts from load_agent_rows.
     """
     from itertools import combinations as _comb
 
@@ -706,19 +770,13 @@ def build_agent_network_data(rows, agent_files):
         agent_net.append({"agent": agent, "paper": paper,
                           "total": total, "cities": top_cities})
 
-    # Paper-competition from agent CSV files
+    # Paper-competition from the agent rows
     paper_city_agents = defaultdict(set)
-    for paper, fpath in (agent_files or {}).items():
-        if not fpath or not os.path.exists(fpath):
-            continue
-        try:
-            with open(fpath, encoding="utf-8-sig") as f:
-                for ag in csv.DictReader(f):
-                    city = ag.get("Agent_City", "").strip()
-                    if city and city.lower() != "travelling":
-                        paper_city_agents[paper].add(city)
-        except Exception:
-            pass
+    for ag in (agent_rows or []):
+        paper = ag.get("_paper", "")
+        city = ag.get("Agent_City", "").strip()
+        if paper and city and city.lower() != "travelling":
+            paper_city_agents[paper].add(city)
 
     paper_competition = {}
     for p1, p2 in _comb(PAPERS, 2):
@@ -801,8 +859,7 @@ PAPERS.forEach(p => { mLayers[p] = L.layerGroup().addTo(lmap); });
 
 function getYrCount(place, sn) {
   if (!mapYear) return place.papers[S2F[sn]] || 0;
-  const key = `${place.loc}|${place.state}|${place.country}`;
-  return ((PLACE_YEAR_DATA[key] || {})[String(mapYear)] || {})[sn] || 0;
+  return ((PLACE_YEAR_DATA[place.key] || {})[String(mapYear)] || {})[sn] || 0;
 }
 
 function rebuildMapLayers() {
@@ -1599,22 +1656,28 @@ def main():
             print("Add a .csv export (e.g. Subscribers2026.csv) and re-run to rebuild.")
             sys.exit(0)
 
-    # Determine agent CSV paths
+    # Determine the agent data source. Priority:
+    #   1. Four explicit per-paper CSV paths passed as args 3-6.
+    #   2. A single combined agents CSV (Agent_Name + Newspaper_Name columns)
+    #      auto-detected next to the subscriber CSV — the current export format.
+    #   3. The four DEFAULT_AGENT_CSVS filenames, if present (older layout).
     csv_dir = os.path.dirname(os.path.abspath(csv_path))
     if len(args) >= 7:
-        # Explicitly provided as args 3-6
-        agent_files = {
+        agent_source = {
             "Israelite": args[2],
             "Occident":  args[3],
             "Messenger": args[4],
             "Gleaner":   args[5],
         }
     else:
-        # Auto-discover by looking in same directory as subscriber CSV
-        agent_files = {}
-        for paper, fname in DEFAULT_AGENT_CSVS.items():
-            candidate = os.path.join(csv_dir, fname)
-            agent_files[paper] = candidate if os.path.exists(candidate) else None
+        combined = autodetect_combined_agents_csv(csv_dir) or autodetect_combined_agents_csv(".")
+        if combined:
+            agent_source = combined
+        else:
+            agent_source = {}
+            for paper, fname in DEFAULT_AGENT_CSVS.items():
+                candidate = os.path.join(csv_dir, fname)
+                agent_source[paper] = candidate if os.path.exists(candidate) else None
 
     print(f"Loading {csv_path}...")
     rows = load_csv(csv_path)
@@ -1648,25 +1711,26 @@ def main():
     data["monopoly"] = mono
 
     # ── Build agent data ──────────────────────────────────────────────
-    found_agents = {p: f for p, f in agent_files.items() if f and os.path.exists(f)}
-    if found_agents:
-        print(f"Building agent data from {len(found_agents)} agent CSV(s)...")
-        for p, f in found_agents.items():
-            print(f"  {p}: {f}")
-        data["agents"] = build_agent_data(agent_files)
+    agent_rows = load_agent_rows(agent_source)
+    if agent_rows:
+        if isinstance(agent_source, str):
+            print(f"Building agent data from combined CSV: {agent_source}")
+        else:
+            found = [p for p, f in agent_source.items() if f and os.path.exists(f)]
+            print(f"Building agent data from {len(found)} per-paper CSV(s): {', '.join(found)}")
+        data["agents"] = build_agent_data(agent_rows)
         print(f"  {len(data['agents']['agent_map'])} agent records loaded")
     else:
-        print("No agent CSVs found — agent tabs will be empty.")
-        print(f"  Place agent CSVs next to {csv_path} with names:")
-        for paper, fname in DEFAULT_AGENT_CSVS.items():
-            print(f"    {fname}  ({paper})")
+        print("No agent CSV found — agent tabs will be empty.")
+        print(f"  Place a combined agents CSV (with Agent_Name + Newspaper_Name columns)")
+        print(f"  next to {csv_path}, or the four DEFAULT_AGENT_CSVS files.")
         data["agents"] = {}
 
     # ── Build coverage, place-year, and network data ──────────────────
     print("Building archival coverage and year-filter data...")
     data["coverage"] = build_coverage_data(rows)
     data["place_year"] = build_place_year_data(rows, data["map"])
-    net = build_agent_network_data(rows, agent_files)
+    net = build_agent_network_data(rows, agent_rows)
     data["agent_net"] = net["agent_net"]
     data["paper_competition"] = net["paper_competition"]
     print(f"  Coverage years computed; place-year data for {len(data['place_year'])} places")
